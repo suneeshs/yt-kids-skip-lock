@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Skip Lock</string>
+    <string name="service_description">In YouTube Kids, each picked video must play for 3 minutes (or to its end) before another can be picked. The player\'s own pause and play stay available.</string>
+</resources>
