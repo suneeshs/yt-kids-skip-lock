@@ -19,11 +19,11 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
+import kotlin.math.abs
 
 private const val TAG = "SkipLock"
 private const val KIDS_PACKAGE = "com.google.android.apps.youtube.kids"
 private const val ID_PREFIX = "$KIDS_PACKAGE:id/"
-private const val LOCK_MS = 3 * 60_000L
 
 // Video tiles' descriptions end with the video length, e.g. "... 32 minutes, 47 seconds".
 private val VIDEO_TILE = Regex("""\d+ (seconds?|minutes?|hours?)$""")
@@ -42,6 +42,11 @@ private fun parseMs(text: String) = TIME_PART.findAll(text).sumOf {
     }
 }
 
+// A position this far off from normal playback counts as scrubbing; smaller gaps are buffering or rounding.
+private const val SCRUB_MS = 5_000L
+
+private class BarReading(val position: Long, val duration: Long, val playing: Boolean, val at: Long)
+
 class SkipLockService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -50,6 +55,7 @@ class SkipLockService : AccessibilityService() {
     private var videoEndsAt: Long? = null
     private var onBrowseScreen = false
     private var playerRect: Rect? = null
+    private var lastBar: BarReading? = null
     private val controlRects = mutableMapOf<String, Rect>()
     private val blocks = mutableListOf<View>()
     private var badge: TextView? = null
@@ -82,7 +88,12 @@ class SkipLockService : AccessibilityService() {
     // A video playing doesn't generate accessibility events, so poll for the player.
     private val poll = object : Runnable {
         override fun run() {
-            if (kidsOnTop()) scanPlayer() else onBrowseScreen = false
+            if (kidsOnTop()) {
+                scanPlayer()
+                if (!isLocked()) refreshOverlay() // keeps the subscribe block in step outside a lock
+            } else {
+                onBrowseScreen = false
+            }
             handler.postDelayed(this, 1000)
         }
     }
@@ -94,7 +105,7 @@ class SkipLockService : AccessibilityService() {
         when (event.eventType) {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> refreshOverlay()
             // Controls showing/hiding or going full screen moves what needs blocking.
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> if (pkg == KIDS_PACKAGE && isLocked()) {
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> if (pkg == KIDS_PACKAGE && (isLocked() || blockSubscribe)) {
                 handler.removeCallbacks(refresh)
                 handler.postDelayed(refresh, 50)
             }
@@ -127,6 +138,7 @@ class SkipLockService : AccessibilityService() {
         playerRect = player
         if (player == null) {
             onBrowseScreen = true
+            lastBar = null
             return null
         }
         // Home-screen tiles don't report a usable label, so going from browsing to the player is the pick.
@@ -136,7 +148,7 @@ class SkipLockService : AccessibilityService() {
             startLock()
         }
         for (id in BLOCKED_IDS) findKidsNode(id)?.screenBounds()?.let { controlRects[id] = it }
-        if (isLocked()) readProgress()
+        if (isLocked()) readProgress() else watchScrub()
         return player
     }
 
@@ -144,13 +156,31 @@ class SkipLockService : AccessibilityService() {
     private fun readProgress() {
         val now = SystemClock.elapsedRealtime()
         if (now - lockStartedAt < 2000) return // the bar may still show the previous video
-        val parts = findKidsNode("time_bar")?.contentDescription?.toString()?.split(" of ") ?: return
-        if (parts.size != 2) return
+        val bar = readBar() ?: return
+        if (videoEndsAt == null && bar.playing) Log.i(TAG, "Video progress read: ${bar.position}ms of ${bar.duration}ms")
+        videoEndsAt = if (bar.playing) now + bar.duration - bar.position else null
+    }
+
+    // Skipping around with the progress bar is as good as picking another video, so it starts a lock.
+    private fun watchScrub() {
+        val bar = readBar() ?: return
+        val prev = lastBar
+        lastBar = bar
+        if (prev == null || prev.duration != bar.duration) return // first reading, or a new video
+        val expected = prev.position + if (prev.playing) bar.at - prev.at else 0
+        if (abs(bar.position - expected) > SCRUB_MS) {
+            Log.i(TAG, "Scrubbed from ${expected}ms to ${bar.position}ms")
+            startLock()
+        }
+    }
+
+    private fun readBar(): BarReading? {
+        val parts = findKidsNode("time_bar")?.contentDescription?.toString()?.split(" of ") ?: return null
+        if (parts.size != 2) return null
         val duration = parseMs(parts[1])
-        if (duration <= 0) return
-        val playing = findKidsNode("pause")?.contentDescription?.startsWith("Pause") ?: return
-        if (videoEndsAt == null && playing) Log.i(TAG, "Video progress read: ${parts[0]} of ${parts[1]}")
-        videoEndsAt = if (playing) now + duration - parseMs(parts[0]) else null
+        if (duration <= 0) return null
+        val playing = findKidsNode("pause")?.contentDescription?.startsWith("Pause") ?: return null
+        return BarReading(parseMs(parts[0]), duration, playing, SystemClock.elapsedRealtime())
     }
 
     // Searches every window: while the lock overlay is up, the active window may not be YouTube Kids.
@@ -163,8 +193,9 @@ class SkipLockService : AccessibilityService() {
 
     private fun startLock() {
         lockStartedAt = SystemClock.elapsedRealtime()
-        lockUntil = lockStartedAt + LOCK_MS
+        lockUntil = lockStartedAt + lockMinutes * 60_000L
         videoEndsAt = null
+        lastBar = null
         handler.removeCallbacks(revealControls)
         handler.postDelayed(revealControls, 2500)
         handler.removeCallbacks(tick)
@@ -179,11 +210,17 @@ class SkipLockService : AccessibilityService() {
             windows.firstOrNull { it.isActive }?.root?.packageName == KIDS_PACKAGE
 
     private fun refreshOverlay() {
-        if (!isLocked() || !kidsOnTop()) {
+        val locked = isLocked()
+        if (!kidsOnTop() || (!locked && !blockSubscribe)) {
             hideOverlay()
             return
         }
+        if (!locked) {
+            showBlocks(subscribeRects())
+            return
+        }
         showBlocks(blockedRects())
+        if (alwaysShowTimer && badge == null) showBadge()
         updateBadgeText()
     }
 
@@ -193,12 +230,13 @@ class SkipLockService : AccessibilityService() {
         badge?.text = "New video in %d:%02d".format(secondsLeft / 60, secondsLeft % 60)
     }
 
-    // The countdown only appears briefly when a blocked area is tapped.
+    // Unless the timer is set to always show, the countdown only appears briefly when a blocked area is tapped.
     private fun flashBadge() {
+        if (!isLocked()) return // a tap on the subscribe block outside a lock has no countdown to show
         if (badge == null) showBadge()
         updateBadgeText()
         handler.removeCallbacks(hideBadge)
-        handler.postDelayed(hideBadge, 3000)
+        if (!alwaysShowTimer) handler.postDelayed(hideBadge, 3000)
     }
 
     // Off the video screen everything is blocked; on it, everything except the player's own controls.
@@ -210,8 +248,16 @@ class SkipLockService : AccessibilityService() {
             Rect(screen.left, player.bottom, screen.right, screen.bottom),
             Rect(screen.left, player.top, player.left, player.bottom),
             Rect(player.right, player.top, screen.right, player.bottom),
-        ).filterNot { it.isEmpty } + controlRects.values
+        ).filterNot { it.isEmpty } + controlRects.values + subscribeRects()
     }
+
+    private fun subscribeRects(): List<Rect> =
+        if (!blockSubscribe) emptyList()
+        else windows.mapNotNull { it.root }
+            .filter { it.packageName == KIDS_PACKAGE }
+            .flatMap { it.findAccessibilityNodeInfosByViewId(ID_PREFIX + "subscribe_button_layout") }
+            .filter { it.isVisibleToUser }
+            .map { it.screenBounds() }
 
     @Suppress("DEPRECATION")
     private fun screenRect(): Rect {
@@ -264,13 +310,14 @@ class SkipLockService : AccessibilityService() {
             textSize = 16f
             setPadding(pad * 2, pad, pad * 2, pad)
             background = GradientDrawable().apply {
-                setColor(0xCC000000.toInt())
+                setColor(0x4D000000.toInt())
                 cornerRadius = 24 * dp
             }
         }
         val params = overlayParams(WRAP_CONTENT, WRAP_CONTENT).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             y = (8 * dp).toInt()
+            flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE // keep taps reaching the player underneath
         }
         getSystemService(WindowManager::class.java).addView(view, params)
         badge = view
