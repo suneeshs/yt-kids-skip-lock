@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -15,6 +16,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -259,10 +261,17 @@ class SkipLockService : AccessibilityService() {
             .filter { it.isVisibleToUser }
             .map { it.screenBounds() }
 
+    // Stops short of the navigation bar (API 30+) so Home and Back stay usable during a lock.
     @Suppress("DEPRECATION")
     private fun screenRect(): Rect {
+        val wm = getSystemService(WindowManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val max = wm.maximumWindowMetrics
+            val nav = max.windowInsets.getInsetsIgnoringVisibility(WindowInsets.Type.navigationBars())
+            return Rect(max.bounds).apply { inset(nav.left, nav.top, nav.right, nav.bottom) }
+        }
         val metrics = DisplayMetrics()
-        getSystemService(WindowManager::class.java).defaultDisplay.getRealMetrics(metrics)
+        wm.defaultDisplay.getRealMetrics(metrics)
         return Rect(0, 0, metrics.widthPixels, metrics.heightPixels)
     }
 
