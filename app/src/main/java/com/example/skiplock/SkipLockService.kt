@@ -30,8 +30,12 @@ private const val ID_PREFIX = "$KIDS_PACKAGE:id/"
 // Video tiles' descriptions end with the video length, e.g. "... 32 minutes, 47 seconds".
 private val VIDEO_TILE = Regex("""\d+ (seconds?|minutes?|hours?)$""")
 
-// Controls inside the player that can leave or skip through the video; only play/pause stays usable.
-private val BLOCKED_IDS = listOf("next", "title_bar", "back_button_container", "watch_fragment_menu_buttons", "time_bar")
+// Controls that can leave or skip through the video; only play/pause stays usable.
+// watch_next_and_control_footer is the suggestion row that slides in under the player with the controls.
+private val BLOCKED_IDS = listOf(
+    "next", "previous", "title_bar", "back_button_container", "watch_fragment_menu_buttons", "time_bar",
+    "watch_next_and_control_footer",
+)
 
 // Progress bar description, e.g. "video player progress bar, 4 minutes 36 seconds of 25 minutes 35 seconds, adjustable".
 private val TIME_PART = Regex("""(\d+) (hour|minute|second)""")
@@ -56,7 +60,7 @@ class SkipLockService : AccessibilityService() {
     private var lockStartedAt = 0L
     private var videoEndsAt: Long? = null
     private var onBrowseScreen = false
-    private var playerRect: Rect? = null
+    private var controlsScreen: Rect? = null
     private var lastBar: BarReading? = null
     private val controlRects = mutableMapOf<String, Rect>()
     private val blocks = mutableListOf<View>()
@@ -134,10 +138,12 @@ class SkipLockService : AccessibilityService() {
     }
 
     // Controls hide after a few seconds, so remember where they last were for the current player layout.
+    // The player shrinks whenever the controls show, so only a rotation invalidates the remembered rects.
     private fun scanPlayer(): Rect? {
+        val screen = screenRect()
+        if (screen != controlsScreen) controlRects.clear()
+        controlsScreen = screen
         val player = findKidsNode("watch_player")?.screenBounds()
-        if (player != playerRect) controlRects.clear()
-        playerRect = player
         if (player == null) {
             onBrowseScreen = true
             lastBar = null
@@ -149,7 +155,10 @@ class SkipLockService : AccessibilityService() {
             Log.i(TAG, "Video opened from a browse screen")
             startLock()
         }
-        for (id in BLOCKED_IDS) findKidsNode(id)?.screenBounds()?.let { controlRects[id] = it }
+        // Union, because a reading taken while the suggestion row slides in or out covers only part of it.
+        for (id in BLOCKED_IDS) findKidsNode(id)?.screenBounds()?.let { r ->
+            controlRects.getOrPut(id) { Rect() }.union(r)
+        }
         if (isLocked()) readProgress() else watchScrub()
         return player
     }
