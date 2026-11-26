@@ -37,6 +37,9 @@ private val BLOCKED_IDS = listOf(
     "watch_next_and_control_footer",
 )
 
+// 4 rects around the player, each blocked control, and the subscribe button.
+private val POOL_SIZE = 4 + BLOCKED_IDS.size + 1
+
 // Progress bar description, e.g. "video player progress bar, 4 minutes 36 seconds of 25 minutes 35 seconds, adjustable".
 private val TIME_PART = Regex("""(\d+) (hour|minute|second)""")
 
@@ -63,6 +66,7 @@ class SkipLockService : AccessibilityService() {
     private var controlsScreen: Rect? = null
     private var lastBar: BarReading? = null
     private val controlRects = mutableMapOf<String, Rect>()
+    private var pauseRect: Rect? = null
     private val blocks = mutableListOf<View>()
     private var badge: TextView? = null
 
@@ -141,7 +145,10 @@ class SkipLockService : AccessibilityService() {
     // The player shrinks whenever the controls show, so only a rotation invalidates the remembered rects.
     private fun scanPlayer(): Rect? {
         val screen = screenRect()
-        if (screen != controlsScreen) controlRects.clear()
+        if (screen != controlsScreen) {
+            controlRects.clear()
+            pauseRect = null
+        }
         controlsScreen = screen
         val player = findKidsNode("watch_player")?.screenBounds()
         if (player == null) {
@@ -159,6 +166,7 @@ class SkipLockService : AccessibilityService() {
         for (id in BLOCKED_IDS) findKidsNode(id)?.screenBounds()?.let { r ->
             controlRects.getOrPut(id) { Rect() }.union(r)
         }
+        findKidsNode("pause")?.screenBounds()?.let { pauseRect = it }
         if (isLocked()) readProgress() else watchScrub()
         return player
     }
@@ -210,7 +218,10 @@ class SkipLockService : AccessibilityService() {
         handler.removeCallbacks(revealControls)
         handler.postDelayed(revealControls, 2500)
         handler.removeCallbacks(tick)
-        tick.run()
+        // A quick second tap can land on a suggestion during the ~0.2 s of window lookups in the full refresh,
+        // so cover the remembered controls first and let that layout happen before the refresh runs.
+        if (kidsOnTop()) showBlocks(controlRects.values.toList())
+        handler.post(tick)
     }
 
     private fun isLocked() = SystemClock.elapsedRealtime() < lockUntil
@@ -222,11 +233,12 @@ class SkipLockService : AccessibilityService() {
 
     private fun refreshOverlay() {
         val locked = isLocked()
-        if (!kidsOnTop() || (!locked && !blockSubscribe)) {
+        if (!kidsOnTop()) {
             hideOverlay()
             return
         }
         if (!locked) {
+            if (!blockSubscribe) removeBadge()
             showBlocks(subscribeRects())
             return
         }
@@ -251,15 +263,33 @@ class SkipLockService : AccessibilityService() {
     }
 
     // Off the video screen everything is blocked; on it, everything except the player's own controls.
+    // Remembered rects can come from another layout with the same screen size (e.g. full screen) and land on
+    // the pause button, so it is always cut out.
     private fun blockedRects(): List<Rect> {
         val screen = screenRect()
         val player = scanPlayer() ?: return listOf(screen)
-        return listOf(
+        // Remembered rects first: their order never changes, so the rects around the player coming and going
+        // with the controls doesn't reassign the window over the suggestion row.
+        val rects = controlRects.values + listOf(
             Rect(screen.left, screen.top, screen.right, player.top),
             Rect(screen.left, player.bottom, screen.right, screen.bottom),
             Rect(screen.left, player.top, player.left, player.bottom),
             Rect(player.right, player.top, screen.right, player.bottom),
-        ).filterNot { it.isEmpty } + controlRects.values + subscribeRects()
+        ).filterNot { it.isEmpty } + subscribeRects()
+        val pause = pauseRect ?: return rects
+        return rects.flatMap { it.minus(pause) }
+    }
+
+    private fun Rect.minus(hole: Rect): List<Rect> {
+        if (!Rect.intersects(this, hole)) return listOf(this)
+        val bandTop = maxOf(top, hole.top)
+        val bandBottom = minOf(bottom, hole.bottom)
+        return listOf(
+            Rect(left, top, right, hole.top),
+            Rect(left, hole.bottom, right, bottom),
+            Rect(left, bandTop, hole.left, bandBottom),
+            Rect(hole.right, bandTop, right, bandBottom),
+        ).filterNot { it.isEmpty }
     }
 
     private fun subscribeRects(): List<Rect> =
@@ -297,27 +327,35 @@ class SkipLockService : AccessibilityService() {
         layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
     }
 
-    private fun showBlocks(rects: List<Rect>) {
+    // Nodes can report bounds behind the navigation bar, so clip to keep it usable.
+    private fun showBlocks(unclipped: List<Rect>) {
+        val screen = screenRect()
+        val rects = unclipped.mapNotNull { r -> Rect(r).takeIf { it.intersect(screen) } }
         val wm = getSystemService(WindowManager::class.java)
-        while (blocks.size > rects.size) wm.removeView(blocks.removeAt(blocks.lastIndex))
-        rects.forEachIndexed { i, r ->
-            val params = overlayParams(r.width(), r.height()).apply {
+        // A new or 0x0 window takes up to a second to get a real size, and taps get through until then,
+        // so windows stay attached at 1x1 while YouTube Kids is on top.
+        while (blocks.size < maxOf(rects.size, POOL_SIZE)) {
+            val block = View(this).apply {
+                setOnTouchListener { _, e ->
+                    if (e.action == MotionEvent.ACTION_DOWN) flashBadge()
+                    true
+                }
+            }
+            wm.addView(block, parkedParams())
+            blocks += block
+        }
+        blocks.forEachIndexed { i, block ->
+            val r = rects.getOrNull(i)
+            val params = if (r == null) parkedParams() else overlayParams(r.width(), r.height()).apply {
                 x = r.left
                 y = r.top
             }
-            if (i < blocks.size) {
-                wm.updateViewLayout(blocks[i], params)
-            } else {
-                val block = View(this).apply {
-                    setOnTouchListener { _, e ->
-                        if (e.action == MotionEvent.ACTION_DOWN) flashBadge()
-                        true
-                    }
-                }
-                wm.addView(block, params)
-                blocks += block
-            }
+            wm.updateViewLayout(block, params)
         }
+    }
+
+    private fun parkedParams() = overlayParams(1, 1).apply {
+        flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
     }
 
     private fun showBadge() {
