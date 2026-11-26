@@ -31,6 +31,18 @@ class MainActivity : Activity() {
                 text = "Open accessibility settings"
                 setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
             })
+            addView(Switch(this@MainActivity).apply {
+                text = "Block in YouTube Kids"
+                isChecked = blockKids
+                setPadding(0, pad, 0, 0)
+                setOnCheckedChangeListener { _, checked -> blockKids = checked }
+            })
+            addView(Switch(this@MainActivity).apply {
+                text = "Block in Netflix"
+                isChecked = blockNetflix
+                setPadding(0, pad, 0, 0)
+                setOnCheckedChangeListener { _, checked -> blockNetflix = checked }
+            })
             addView(TextView(this@MainActivity).apply {
                 text = "Lock duration (minutes)"
                 setPadding(0, pad, 0, 0)

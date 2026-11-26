@@ -10,6 +10,12 @@ bar are blocked, so only the player's own play/pause works. Every other YouTube 
 screen is fully covered, so backing out to the home screen doesn't help. A countdown badge shows
 at the top for 3 seconds whenever a blocked area is tapped.
 
+Netflix works the same way, with one free skip: after each lock, the first episode picked (by
+opening it or tapping "Next Ep.") doesn't start the lock, but the next pick does. Seeking also starts
+the lock, except for the first seek in each episode. Picking something after watching an episode to the end
+never counts. During the lock only the play/pause button
+works. A lock started in either app also fully covers the other one until it ends.
+
 ## 1. Build and install
 
 Open this folder in Android Studio, let it sync, then Run.
@@ -30,6 +36,8 @@ Every tap in YouTube Kids logs `Click id=... desc='...' (picksVideo=true|false)`
 
 Open the "Skip Lock" app:
 
+- **Block in YouTube Kids** / **Block in Netflix**: on by default. Turning one off leaves that app
+  completely alone.
 - **Lock duration (minutes)**: default 3. Saved when you leave the app, applies from the next video pick.
 - **Always show countdown timer**: off (default) flashes the countdown for 3 seconds when a blocked
   area is tapped; on keeps it visible for the whole lock.

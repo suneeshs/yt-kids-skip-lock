@@ -18,3 +18,11 @@ var Context.alwaysShowTimer: Boolean
 var Context.blockSubscribe: Boolean
     get() = prefs().getBoolean("block_subscribe", false)
     set(value) = prefs().edit().putBoolean("block_subscribe", value).apply()
+
+var Context.blockKids: Boolean
+    get() = prefs().getBoolean("block_kids", true)
+    set(value) = prefs().edit().putBoolean("block_kids", value).apply()
+
+var Context.blockNetflix: Boolean
+    get() = prefs().getBoolean("block_netflix", true)
+    set(value) = prefs().edit().putBoolean("block_netflix", value).apply()
